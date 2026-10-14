@@ -14,8 +14,8 @@ import (
 // proxy routing (460/461). It is keyed by MCC with a display name for logs and
 // user-facing messaging.
 var BlockedMCCs = map[string]string{
-	"460": "中国",
-	"461": "中国",
+//	"460": "中国",
+//	"461": "中国",
 }
 
 // CardMCCMNC splits an IMSI into its mobile country code and mobile network
