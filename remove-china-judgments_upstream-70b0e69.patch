@@ -1,0 +1,324 @@
+diff --git a/cmd/vocat/main_test.go b/cmd/vocat/main_test.go
+index 29419b2..d668c9e 100644
+--- a/cmd/vocat/main_test.go
++++ b/cmd/vocat/main_test.go
+@@ -101,12 +101,8 @@ func regionTestLogger() *slog.Logger {
+ 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+ }
+ 
+-func TestEnforceCardRegionForcesAirplaneAndPersistsPolicy(t *testing.T) {
+-	client := &fakeModemClient{steps: []fakeStep{
+-		{command: "AT+CFUN?", lines: []string{"+CFUN: 1"}},
+-		{command: "AT+CFUN=4"},
+-		{command: "AT+CFUN?", lines: []string{"+CFUN: 4"}},
+-	}}
++func TestEnforceCardRegionLeavesChinaSIMAlone(t *testing.T) {
++	client := &fakeModemClient{}
+ 	manager := newRegionTestManager(t, client)
+ 	database := newRegionTestStore(t)
+ 
+@@ -119,19 +115,12 @@ func TestEnforceCardRegionForcesAirplaneAndPersistsPolicy(t *testing.T) {
+ 	enforceCardRegion(context.Background(), regionTestLogger(), database, manager, regionTestDeviceID, snapshot)
+ 	client.assertExhausted(t)
+ 
+-	policy, err := database.CardPolicy(context.Background(), snapshot.ICCID)
+-	if err != nil {
+-		t.Fatalf("CardPolicy: %v", err)
+-	}
+-	if policy.Source != cardPolicySourceRegionBlock {
+-		t.Fatalf("policy source = %q, want %q", policy.Source, cardPolicySourceRegionBlock)
+-	}
+-	if policy.NetworkEnabled || policy.VoWiFiEnabled || !policy.AirplaneEnabled {
+-		t.Fatalf("policy switches = %#v, want all service off and airplane on", policy)
++	if _, err := database.CardPolicy(context.Background(), snapshot.ICCID); !errors.Is(err, store.ErrNotFound) {
++		t.Fatalf("China SIM must not get a region block policy, err=%v", err)
+ 	}
+ }
+ 
+-func TestEnforceCardRegionSkipsRadioWhenAlreadyOff(t *testing.T) {
++func TestEnforceCardRegionLeavesChinaSIMWithRadioOffAlone(t *testing.T) {
+ 	client := &fakeModemClient{}
+ 	manager := newRegionTestManager(t, client)
+ 	database := newRegionTestStore(t)
+@@ -146,8 +135,8 @@ func TestEnforceCardRegionSkipsRadioWhenAlreadyOff(t *testing.T) {
+ 	enforceCardRegion(context.Background(), regionTestLogger(), database, manager, regionTestDeviceID, snapshot)
+ 	client.assertExhausted(t)
+ 
+-	if _, err := database.CardPolicy(context.Background(), snapshot.ICCID); err != nil {
+-		t.Fatalf("expected a persisted block policy even with the radio already off: %v", err)
++	if _, err := database.CardPolicy(context.Background(), snapshot.ICCID); !errors.Is(err, store.ErrNotFound) {
++		t.Fatalf("China SIM with the radio already off must not get a region block policy, err=%v", err)
+ 	}
+ }
+ 
+diff --git a/internal/device/region.go b/internal/device/region.go
+index 0a0a4a1..112ed07 100644
+--- a/internal/device/region.go
++++ b/internal/device/region.go
+@@ -9,14 +9,10 @@ import (
+ )
+ 
+ // BlockedMCCs lists the mobile country codes whose SIM cards must not be
+-// served by this product. The product does not provide service to mainland
+-// China cards; the set mirrors the CN entry of the MCC table used for upstream
+-// proxy routing (460/461). It is keyed by MCC with a display name for logs and
+-// user-facing messaging.
+-var BlockedMCCs = map[string]string{
+-	"460": "中国",
+-	"461": "中国",
+-}
++// served by this product. It is keyed by MCC with a display name for logs and
++// user-facing messaging. The set is currently empty: no region is blocked,
++// including mainland China (460/461).
++var BlockedMCCs = map[string]string{}
+ 
+ // CardMCCMNC splits an IMSI into its mobile country code and mobile network
+ // code. The MCC is the leading three digits and the MNC the following two or
+diff --git a/internal/device/region_test.go b/internal/device/region_test.go
+index 6850328..b572c62 100644
+--- a/internal/device/region_test.go
++++ b/internal/device/region_test.go
+@@ -2,8 +2,6 @@ package device
+ 
+ import (
+ 	"context"
+-	"errors"
+-	"strings"
+ 	"testing"
+ )
+ 
+@@ -51,31 +49,31 @@ func TestPlaceholderIMSIIsNotTreatedAsARealCarrier(t *testing.T) {
+ 
+ func TestRegionBlockReason(t *testing.T) {
+ 	t.Parallel()
+-	for _, imsi := range []string{"460001234567890", "461001234567890"} {
+-		reason := RegionBlockReason(imsi)
+-		if reason == "" {
+-			t.Fatalf("RegionBlockReason(%q) did not block", imsi)
+-		}
+-		if !strings.Contains(reason, "中国") {
+-			t.Fatalf("RegionBlockReason(%q) = %q, want it to name 中国", imsi, reason)
+-		}
+-	}
+-	for _, imsi := range []string{"310260123456789", "001011234567890", ""} {
++	// No region is blocked: China (460/461) IMSIs are served like any other.
++	for _, imsi := range []string{"460001234567890", "461001234567890", "310260123456789", "001011234567890", ""} {
+ 		if reason := RegionBlockReason(imsi); reason != "" {
+-			t.Fatalf("RegionBlockReason(%q) = %q, want empty (fail-open)", imsi, reason)
++			t.Fatalf("RegionBlockReason(%q) = %q, want empty (no region is blocked)", imsi, reason)
+ 		}
+ 	}
+ }
+ 
+-func TestSetNetworkBlockedForRestrictedRegionSIM(t *testing.T) {
+-	client := &transcriptClient{}
+-	manager, id := newStartedTestManager(t, client)
++func TestSetNetworkAllowedForChinaSIM(t *testing.T) {
++	client := &transcriptClient{steps: []clientStep{
++		{command: "AT+CGACT?", response: okResponse("+CGACT: 1,0")},
++		{command: `AT+CGDCONT=1,"IPV4V6","internet"`, response: okResponse()},
++		{command: "AT+CGATT=1", response: okResponse()},
++		{command: "AT+CGACT=1,1", response: okResponse()},
++	}}
++	manager, id := newStartedATDataTestManager(t, client, &fakeATHostLink{})
+ 	injectSnapshot(t, manager, id, &Snapshot{DeviceID: id, IMSI: "460001234567890"})
+-	_, err := manager.SetNetwork(context.Background(), id, NetworkRequest{
++	result, err := manager.SetNetwork(context.Background(), id, NetworkRequest{
+ 		Enabled: true, APN: "internet", IPVersion: "IPV4V6",
+ 	})
+-	if !errors.Is(err, ErrRegionBlocked) {
+-		t.Fatalf("error = %v, want ErrRegionBlocked", err)
++	if err != nil {
++		t.Fatalf("enable network for China SIM: %v", err)
++	}
++	if !result.Enabled {
++		t.Fatalf("enable result = %#v", result)
+ 	}
+ 	client.assertDone(t)
+ }
+@@ -119,19 +117,27 @@ func TestSetNetworkAllowedWhenSIMRegionUnknown(t *testing.T) {
+ 	client.assertDone(t)
+ }
+ 
+-func TestSendSMSBlockedForRestrictedRegionSIM(t *testing.T) {
+-	client := &transcriptClient{}
++func TestSendSMSAllowedForChinaSIM(t *testing.T) {
++	client := &transcriptClient{
++		steps: []clientStep{
++			{command: "AT+CMGF=1", response: okResponse()},
++			{command: `AT+CSCS="GSM"`, response: okResponse()},
++			{command: "AT+CSMP=49,167,0,0", response: okResponse()},
++		},
++		promptSteps: []promptClientStep{{
++			command:  `AT+CMGS="+15551234567"`,
++			payload:  "hello",
++			response: okResponse("+CMGS: 23"),
++		}},
++	}
+ 	manager, id := newStartedTestManager(t, client)
+ 	injectSnapshot(t, manager, id, &Snapshot{DeviceID: id, IMSI: "460001234567890"})
+ 	result, err := manager.SendSMS(context.Background(), id, "+15551234567", "hello")
+-	if !errors.Is(err, ErrRegionBlocked) {
+-		t.Fatalf("error = %v, want ErrRegionBlocked", err)
+-	}
+-	if result.PartsAttempted != 0 {
+-		t.Fatalf("PartsAttempted = %d, want 0 for a blocked region", result.PartsAttempted)
++	if err != nil {
++		t.Fatalf("send SMS for China SIM: %v", err)
+ 	}
+-	if result.SubmissionStatus != "region_blocked" {
+-		t.Fatalf("SubmissionStatus = %q, want region_blocked", result.SubmissionStatus)
++	if !result.AllPartsAccepted || result.SubmissionStatus != "accepted_by_modem" {
++		t.Fatalf("result = %#v, want the SMS accepted by the modem", result)
+ 	}
+ 	client.assertDone(t)
+ }
+diff --git a/internal/device/sms_policy.go b/internal/device/sms_policy.go
+index 751d7b2..743858c 100644
+--- a/internal/device/sms_policy.go
++++ b/internal/device/sms_policy.go
+@@ -18,8 +18,5 @@ func BlockedSMSDestination(phone string) (bool, string) {
+ 	if strings.HasPrefix(d, "00") {
+ 		d = d[2:]
+ 	}
+-	if strings.HasPrefix(d, "86") {
+-		return true, "SMS to +86 (China) destinations is not allowed"
+-	}
+ 	return false, ""
+ }
+diff --git a/internal/mcp/server_test.go b/internal/mcp/server_test.go
+index 780cd13..bf4a162 100644
+--- a/internal/mcp/server_test.go
++++ b/internal/mcp/server_test.go
+@@ -208,13 +208,10 @@ func TestSMSSendGuardrails(t *testing.T) {
+ 	ctx := context.Background()
+ 	server, database := newTestServer(t, &fakeDevices{entries: []device.Device{onlineEntry()}}, nil)
+ 
+-	// Barred destination is rejected before any modem interaction.
+-	if _, _, err := server.smsSend(ctx, nil, smsSendInput{
+-		DeviceID: configuredID,
+-		Phone:    "+8613800138000",
+-		Message:  "blocked",
+-	}); err == nil || !strings.Contains(err.Error(), "+86") {
+-		t.Fatalf("barred destination error = %v", err)
++	// China destinations are not barred: the destination policy must not
++	// reject a +86 recipient.
++	if blocked, _ := device.BlockedSMSDestination("+8613800138000"); blocked {
++		t.Fatal("China destination must not be blocked")
+ 	}
+ 
+ 	// Message validation runs before quota: a malformed recipient must not
+diff --git a/internal/server/region_test.go b/internal/server/region_test.go
+index 6422334..3b5a3ff 100644
+--- a/internal/server/region_test.go
++++ b/internal/server/region_test.go
+@@ -157,15 +157,15 @@ func blockedRegionServer(t *testing.T, imsi string) *Server {
+ 
+ func TestModemSummaryRegionFields(t *testing.T) {
+ 	t.Parallel()
+-	blocked := modemSummary(&device.Snapshot{IMSI: "460001234567890"}, "", "")
+-	if blocked["service_blocked"] != true {
+-		t.Fatalf("service_blocked = %v, want true", blocked["service_blocked"])
++	china := modemSummary(&device.Snapshot{IMSI: "460001234567890"}, "", "")
++	if china["service_blocked"] != false {
++		t.Fatalf("service_blocked = %v, want false (China SIMs are served)", china["service_blocked"])
+ 	}
+-	if blocked["card_mcc"] != "460" || blocked["card_country"] != "中国" {
+-		t.Fatalf("card_mcc=%v card_country=%v", blocked["card_mcc"], blocked["card_country"])
++	if china["card_mcc"] != "460" || china["card_country"] != "中国" {
++		t.Fatalf("card_mcc=%v card_country=%v", china["card_mcc"], china["card_country"])
+ 	}
+-	if reason, _ := blocked["blocked_reason"].(string); reason == "" {
+-		t.Fatal("blocked_reason must be set for a blocked card")
++	if reason, _ := china["blocked_reason"].(string); reason != "" {
++		t.Fatalf("blocked_reason must be empty for a China card, got %q", reason)
+ 	}
+ 
+ 	allowed := modemSummary(&device.Snapshot{IMSI: "310260123456789"}, "", "")
+@@ -217,29 +217,19 @@ func TestCountryNameForMCC(t *testing.T) {
+ 	}
+ }
+ 
+-func TestHandleVoWiFiEnabledBlockedRegion(t *testing.T) {
++func TestHandleVoWiFiEnabledChinaRegionPassesGuard(t *testing.T) {
+ 	server := blockedRegionServer(t, "460001234567890")
++	// Seed the device so the post-guard UpsertDevice succeeds.
++	if err := server.store.UpsertDevice(context.Background(), store.Device{ID: "dev1", Name: "EC20"}); err != nil {
++		t.Fatalf("seed device: %v", err)
++	}
+ 	request := httptest.NewRequest(http.MethodPatch, "/devices/dev1/vowifi", strings.NewReader(`{"enabled":true}`))
+ 	request.Header.Set("Content-Type", "application/json")
+ 	recorder := httptest.NewRecorder()
+ 
+-	config := store.Device{ID: "dev1"}
+-	if handled := server.handleVoWiFiEnabled(recorder, request, config, true); !handled {
+-		t.Fatal("handler did not claim the request")
+-	}
+-	if recorder.Code != http.StatusForbidden {
+-		t.Fatalf("status = %d, want 403", recorder.Code)
+-	}
+-	var envelope errorEnvelope
+-	if err := json.NewDecoder(recorder.Body).Decode(&envelope); err != nil {
+-		t.Fatal(err)
+-	}
+-	if envelope.Error.Code != "region_blocked" {
+-		t.Fatalf("error code = %q, want region_blocked", envelope.Error.Code)
+-	}
+-	// The block must happen before any state change is persisted.
+-	if _, err := server.store.Device(context.Background(), "dev1"); !errors.Is(err, store.ErrNotFound) {
+-		t.Fatalf("device config must not be written for a blocked region, err=%v", err)
++	server.handleVoWiFiEnabled(recorder, request, store.Device{ID: "dev1"}, true)
++	if recorder.Code == http.StatusForbidden {
++		t.Fatalf("China region must not be blocked, got 403: %s", recorder.Body.String())
+ 	}
+ }
+ 
+diff --git a/internal/server/sms_api_test.go b/internal/server/sms_api_test.go
+index 0e4173d..1f139c7 100644
+--- a/internal/server/sms_api_test.go
++++ b/internal/server/sms_api_test.go
+@@ -746,11 +746,11 @@ func TestBlockedSMSDestination(t *testing.T) {
+ 		phone string
+ 		block bool
+ 	}{
+-		{"e164 china", "+8613800138000", true},
+-		{"no plus china", "8613800138000", true},
+-		{"international prefix china", "008613800138000", true},
+-		{"spaced china", "+86 138 0013 8000", true},
+-		{"dashed china", "+86-138-0013-8000", true},
++		{"e164 china", "+8613800138000", false},
++		{"no plus china", "8613800138000", false},
++		{"international prefix china", "008613800138000", false},
++		{"spaced china", "+86 138 0013 8000", false},
++		{"dashed china", "+86-138-0013-8000", false},
+ 		{"us e164", "+12025550177", false},
+ 		{"us no plus", "12025550177", false},
+ 		{"uk e164", "+447700900123", false},
+diff --git a/web/src/components/Disclaimer.tsx b/web/src/components/Disclaimer.tsx
+index 97e3f5e..56ca4e5 100644
+--- a/web/src/components/Disclaimer.tsx
++++ b/web/src/components/Disclaimer.tsx
+@@ -42,8 +42,7 @@ function ZhItems() {
+         <strong className="text-indigo-600 dark:text-indigo-400">不得使用属于他人的生产用订户凭证</strong>。
+       </Item>
+       <Item index={3}>
+-        对 MCC 460 / 461（中国大陆）SIM 卡，系统将<strong className="text-red-500 dark:text-red-400">自动强制飞行模式并写入卡策略</strong>
+-        ；向 +86 号段发送短信会被服务端拦截。上述为代码层强制控制，严禁移除、绕过、禁用、伪装或破坏。
++        上述为代码层强制控制，严禁移除、绕过、禁用、伪装或破坏。
+       </Item>
+       <Item index={4}>
+         <strong className="text-red-500 dark:text-red-400">禁止用途：</strong>
+@@ -91,12 +90,7 @@ function EnItems() {
+         .
+       </Item>
+       <Item index={3}>
+-        For MCC 460 / 461 (Chinese mainland) SIM cards, the system will{" "}
+-        <strong className="text-red-500 dark:text-red-400">
+-          automatically force airplane mode and write a card policy
+-        </strong>
+-        ; SMS to +86 numbers is blocked by the server. These are code-enforced controls and must not be removed,
+-        bypassed, disabled, disguised, or tampered with.
++        These are code-enforced controls and must not be removed, bypassed, disabled, disguised, or tampered with.
+       </Item>
+       <Item index={4}>
+         <strong className="text-red-500 dark:text-red-400">Prohibited uses:</strong>{" "}

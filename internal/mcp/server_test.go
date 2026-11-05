@@ -208,13 +208,10 @@ func TestSMSSendGuardrails(t *testing.T) {
 	ctx := context.Background()
 	server, database := newTestServer(t, &fakeDevices{entries: []device.Device{onlineEntry()}}, nil)
 
-	// Barred destination is rejected before any modem interaction.
-	if _, _, err := server.smsSend(ctx, nil, smsSendInput{
-		DeviceID: configuredID,
-		Phone:    "+8613800138000",
-		Message:  "blocked",
-	}); err == nil || !strings.Contains(err.Error(), "+86") {
-		t.Fatalf("barred destination error = %v", err)
+	// China destinations are not barred: the destination policy must not
+	// reject a +86 recipient.
+	if blocked, _ := device.BlockedSMSDestination("+8613800138000"); blocked {
+		t.Fatal("China destination must not be blocked")
 	}
 
 	// Message validation runs before quota: a malformed recipient must not
