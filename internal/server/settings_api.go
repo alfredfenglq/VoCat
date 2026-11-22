@@ -45,10 +45,15 @@ var notificationChannels = []string{
 	"wecom",
 	"lark",
 	"meow",
+	"qqbot",
 }
 
 var notificationFields = map[string]map[string]string{
 	"meow": {"nickname": "string", "url": "string", "img_url": "string"},
+	"qqbot": {
+		"app_id": "string", "app_secret": "string", "target_openid": "string",
+		"proxy": "string",
+	},
 	"telegram": {
 		"bot_token": "string", "chat_id": "string", "admin_id": "string",
 		"base_url": "string", "proxy": "string",
@@ -63,7 +68,7 @@ var notificationFields = map[string]map[string]string{
 	},
 	"bark": {
 		"urls": "strings", "group": "string", "icon": "string", "level": "string",
-		"url_scopes": "url_scopes",
+		"url_scopes": "url_scopes", barkEncryptionKeyField: "bark_encryption_key",
 	},
 	"pushplus": {
 		"token": "string", "topic": "string", "channel": "string",
@@ -108,6 +113,11 @@ func (s *Server) routeSettingsAPI(
 		return true
 	}
 	segments := splitAPIPath(cleanPath)
+	if len(segments) == 4 && segments[0] == "settings" && segments[1] == "notifications" &&
+		segments[2] == "qqbot" && segments[3] == "bind" {
+		s.handleQQBotBind(w, r)
+		return true
+	}
 	if len(segments) == 4 &&
 		segments[0] == "settings" &&
 		segments[1] == "notifications" &&
@@ -157,11 +167,18 @@ func (s *Server) handleNotificationSettings(w http.ResponseWriter, r *http.Reque
 			}
 			clearSecrets := false
 			if flag, present := document["clear_secrets"]; present {
-				if (channel != "telegram" && channel != "email") || string(flag) == "null" || json.Unmarshal(flag, &clearSecrets) != nil {
+				if (channel != "telegram" && channel != "email" && channel != "qqbot" && channel != "bark") ||
+					string(flag) == "null" || json.Unmarshal(flag, &clearSecrets) != nil {
 					writeError(w, http.StatusBadRequest, "invalid_notification_config", "clear_secrets must be a boolean for a supported channel")
 					return
 				}
 				delete(document, "clear_secrets")
+			}
+			if channel == "bark" && clearSecrets {
+				var key string
+				if json.Unmarshal(document[barkEncryptionKeyField], &key) == nil && key == store.SecretMask {
+					delete(document, barkEncryptionKeyField)
+				}
 			}
 			raw, err := json.Marshal(document)
 			if err != nil {
@@ -196,8 +213,15 @@ func (s *Server) handleNotificationSettings(w http.ResponseWriter, r *http.Reque
 				return
 			}
 		}
-		if err := s.store.SaveNotificationSettings(r.Context(), values); err != nil {
-			s.writeStoreError(w, err)
+		if err := s.saveNotificationSettings(r.Context(), values); err != nil {
+			switch {
+			case errors.Is(err, errQQBotSecretRequired):
+				writeError(w, http.StatusBadRequest, "invalid_notification_config", err.Error())
+			case errors.Is(err, store.ErrBarkEncryptionKeyRequired):
+				writeError(w, http.StatusBadRequest, "invalid_notification_config", store.ErrBarkEncryptionKeyRequired.Error())
+			default:
+				s.writeStoreError(w, err)
+			}
 			return
 		}
 		s.writeNotificationSettings(w, r)
@@ -205,6 +229,34 @@ func (s *Server) handleNotificationSettings(w http.ResponseWriter, r *http.Reque
 		w.Header().Set("Allow", "GET, PUT")
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 	}
+}
+
+// saveNotificationSettings serializes QQ configuration changes with binding commits.
+// A failed save leaves the binding intact, while a successful save invalidates
+// both active sessions and drafts that are still preparing their network setup.
+func (s *Server) saveNotificationSettings(ctx context.Context, values []store.NotificationSetting) error {
+	for _, value := range values {
+		if value.Channel != "qqbot" {
+			continue
+		}
+		s.qqBotBindMu.Lock()
+		defer s.qqBotBindMu.Unlock()
+		if len(value.ClearSensitiveFields) == 0 {
+			if err := s.checkQQBotSecretReentry(ctx, value.Config); err != nil {
+				return err
+			}
+		}
+		if err := s.store.SaveNotificationSettings(ctx, values); err != nil {
+			return err
+		}
+		s.qqBotConfigRevision++
+		if session := s.qqBotBind; session != nil && !session.finished() {
+			session.cancel()
+			session.Status = qqBotBindCanceled
+		}
+		return nil
+	}
+	return s.store.SaveNotificationSettings(ctx, values)
 }
 
 func (s *Server) writeNotificationSettings(w http.ResponseWriter, r *http.Request) {
@@ -270,6 +322,12 @@ func decodeNotificationConfig(
 		if name == "device_ids" {
 			kind, known = "device_ids", true
 		}
+		if channel == "bark" && !requireEnabled && name == "clear_secrets" {
+			kind, known = "boolean", true
+			if string(value) == "null" {
+				return false, nil, errors.New("bark.clear_secrets must be a boolean")
+			}
+		}
 		if !known {
 			return false, nil, fmt.Errorf("%s.%s is not supported", channel, name)
 		}
@@ -323,6 +381,14 @@ func validateNotificationField(
 		var value bool
 		if err := json.Unmarshal(raw, &value); err != nil {
 			return fmt.Errorf("%s must be a boolean", field)
+		}
+	case "bark_encryption_key":
+		var value *string
+		if err := json.Unmarshal(raw, &value); err != nil || value == nil {
+			return fmt.Errorf("%s must be a string", field)
+		}
+		if *value != "" && *value != store.SecretMask {
+			return validateBarkEncryptionKey(*value)
 		}
 	case "string":
 		var value string
@@ -472,7 +538,7 @@ func (s *Server) handleNotificationTest(
 		writeError(w, http.StatusNotFound, "not_found", "notification channel was not found")
 		return
 	}
-	if channel != "webhook" && channel != "telegram" && channel != "email" && channel != "bark" && channel != "wecom" && channel != "lark" && channel != "meow" {
+	if channel != "webhook" && channel != "telegram" && channel != "email" && channel != "bark" && channel != "wecom" && channel != "lark" && channel != "meow" && channel != "qqbot" {
 		writeError(
 			w,
 			http.StatusNotImplemented,
@@ -489,6 +555,9 @@ func (s *Server) handleNotificationTest(
 	_, incoming, err := decodeNotificationConfig(channel, raw, false)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_notification_config", err.Error())
+		return
+	}
+	if channel == "qqbot" && !s.qqBotSecretReentered(w, r, incoming) {
 		return
 	}
 	resolved, provider, err := s.resolveNotificationTestConfig(
@@ -530,6 +599,8 @@ func (s *Server) handleNotificationTest(
 		err = sendLarkNotificationTest(notificationContext, resolved)
 	case "meow":
 		err = sendMeowNotification(notificationContext, resolved, nil, "VoCat 测试通知", "VoCat 消息推送测试")
+	case "qqbot":
+		err = sendQQBotNotification(notificationContext, resolved, nil, "VoCat 测试通知", "VoCat 消息推送测试")
 	}
 	if err != nil {
 		redacted := store.RedactText(err.Error(), provider)
@@ -601,13 +672,35 @@ func (s *Server) resolveNotificationTestConfig(
 	if err := json.Unmarshal(incoming, &overlay); err != nil {
 		return nil, store.NotificationSetting{}, fmt.Errorf("decode notification test config: %w", err)
 	}
+	if channel == "bark" {
+		key, hasKey := overlay[barkEncryptionKeyField].(string)
+		if clear, _ := overlay["clear_secrets"].(bool); clear {
+			delete(resolved, barkEncryptionKeyField)
+			if key == store.SecretMask {
+				delete(overlay, barkEncryptionKeyField)
+			}
+		}
+		if hasKey && key == "" {
+			delete(overlay, barkEncryptionKeyField)
+		}
+		delete(overlay, "clear_secrets")
+	}
 	sensitive := make(map[string]struct{})
 	for _, field := range store.DefaultNotificationSensitiveFields(channel) {
 		sensitive[field] = struct{}{}
 	}
 	for key, value := range overlay {
 		if _, secret := sensitive[key]; secret {
-			value = mergeNotificationTestSecretValue(value, resolved[key])
+			if channel == "bark" && key == barkEncryptionKeyField && value == store.SecretMask {
+				// An unresolved Bark mask must reach validation as a mask. An
+				// empty saved value would turn this test into a plaintext send.
+				saved, _ := resolved[key].(string)
+				if validateBarkEncryptionKey(saved) == nil {
+					value = saved
+				}
+			} else {
+				value = mergeNotificationTestSecretValue(value, resolved[key])
+			}
 		}
 		resolved[key] = value
 	}
@@ -673,6 +766,9 @@ func validateNotificationTestConfig(channel string, config map[string]any) error
 	if channel == "meow" {
 		return validateMeowNotificationConfig(config)
 	}
+	if channel == "qqbot" {
+		return validateQQBotNotificationConfig(config)
+	}
 	switch channel {
 	case "webhook":
 		urls := configStrings(config, "urls")
@@ -689,6 +785,9 @@ func validateNotificationTestConfig(channel string, config map[string]any) error
 		}
 		if len(urls) > 8 {
 			return errors.New("bark test is limited to 8 URLs")
+		}
+		if _, err := barkNotificationCipher(config); err != nil {
+			return err
 		}
 	case "wecom":
 		return validateWecomNotificationConfig(config)
@@ -773,45 +872,8 @@ func sendWebhookNotificationTest(ctx context.Context, config map[string]any) err
 }
 
 func sendBarkNotificationTest(ctx context.Context, config map[string]any) error {
-	client, err := restrictedHTTPClient(ctx, 6*time.Second, "")
-	if err != nil {
-		return err
-	}
-	message := map[string]any{
-		"title": "vocat",
-		"body":  "vocat notification test",
-	}
-	if group := configString(config, "group"); group != "" {
-		message["group"] = group
-	}
-	if icon := configString(config, "icon"); icon != "" {
-		message["icon"] = icon
-	}
-	if level := configString(config, "level"); level != "" {
-		message["level"] = level
-	}
-	payload, _ := json.Marshal(message)
-	for _, destination := range configStrings(config, "urls") {
-		parsed, err := validateOutboundURL(ctx, destination, false)
-		if err != nil {
-			return err
-		}
-		request, err := http.NewRequestWithContext(
-			ctx,
-			http.MethodPost,
-			parsed.String(),
-			bytes.NewReader(payload),
-		)
-		if err != nil {
-			return fmt.Errorf("create bark test request: %w", err)
-		}
-		request.Header.Set("Content-Type", "application/json; charset=utf-8")
-		request.Header.Set("User-Agent", "vocat-notification-test/1")
-		if err := performNotificationRequest(client, request, false); err != nil {
-			return err
-		}
-	}
-	return nil
+	return sendBarkNotification(ctx, config, configStrings(config, "urls"),
+		"vocat", "vocat notification test", "vocat-notification-test/1", 6*time.Second)
 }
 
 func sendTelegramNotificationTest(ctx context.Context, config map[string]any) error {
